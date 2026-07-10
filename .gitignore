@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+env/
+
+# Data and model files (too large for git — in the IOW DOI repository)
+*.nii.gz
+*.pth
+*.zip
+*.tif
+*.TIF
+
+# Logs and reports
+*.log
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db

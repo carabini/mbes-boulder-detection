@@ -1,0 +1,12 @@
+{
+    "NH": {
+        "bathy_orig": "data/NH_bathy.tif",
+        "apoc_pred": "data/NH_apoc_pred.tif",
+        "nnunet_pred": "data/NH_nnunet_labeled.tif"
+    },
+    "FMB": {
+        "bathy_orig": "data/FMB_bathy.tif",
+        "apoc_pred": "data/FMB_apoc_pred.tif",
+        "nnunet_pred": "data/FMB_nnunet_labeled.tif"
+    }
+}

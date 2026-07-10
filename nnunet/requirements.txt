@@ -1,0 +1,12 @@
+# Python 3.10.18
+# nnU-Net training/inference environment (used via CLI: nnUNetv2_train / nnUNetv2_predict).
+# Install torch/torchvision matching your CUDA version first, see:
+# https://pytorch.org/get-started/locally/
+
+torch==2.3.1
+torchvision==0.18.1
+nnunetv2==2.6.4
+nibabel==5.4.2
+rasterio==1.5.0
+numpy==1.26.4
+scipy==1.13.1
