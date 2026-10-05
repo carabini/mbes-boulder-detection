@@ -5,8 +5,10 @@ Predict boulders on a GeoTIFF using the APOC-25 classifier (25% sparse annotatio
 10:1 bg:boulder ratio, sigma=2,3,4,6) — or any compatible classifier passed via --classifier.
 
 Matches training pipeline:
+  - NaN-fill at the original resolution with a normalised Gaussian convolution
+    (sigma=5 px; same fill as nnunet/predict_folder.py). The training tiles
+    contained no NoData, where the fill is a no-op.
   - Upscale 2x bilinear before prediction (matches training data preparation)
-  - NaN-fill with Gaussian sigma=5
   - Predict with tiled inference (TILE_SIZE + OVERLAP px border)
   - Compute boulder statistics (area, height, L/W, centroid)
 
@@ -120,19 +122,35 @@ if pixel_sx > 0 and abs(pixel_sx - pixel_sy) / pixel_sx > 0.01:
           f"ring width is derived from the x pixel size only.")
 
 
-# ── 2. Upscale 2x bilinear ────────────────────────────────────────────────────
-print(f"\n[2/4] Upscaling {SCALE}x (bilinear) ...")
+# ── 2. NaN fill (sigma=5) at the original resolution ─────────────────────────
+# Same fill as nnunet/predict_folder.py: normalised Gaussian convolution (the
+# blurred data divided by the blurred validity mask), so every filled pixel is a
+# local weighted mean of the valid depths around it. Pixels with no valid data
+# in reach get the mean of the valid data.
+print("\n[2/4] NaN fill (sigma=5) ...")
+raw_filled = raw
+if nan_orig.any():
+    num = gaussian_filter(np.where(nan_orig, 0.0, raw).astype(np.float64), sigma=5)
+    den = gaussian_filter((~nan_orig).astype(np.float64), sigma=5)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        fill = np.where(den > 1e-8, num / den, np.nan)
+    fill = np.where(np.isfinite(fill), fill, np.nanmean(raw))
+    raw_filled = np.where(nan_orig, fill, raw).astype(np.float32)
+print(f"  Filled {nan_orig.sum():,} NaN pixels")
+
+
+# ── 3. Upscale 2x bilinear ────────────────────────────────────────────────────
+print(f"\n[3/4] Upscaling {SCALE}x (bilinear) ...")
 t0 = time.time()
 
-# Fill NaN with local mean before interpolation, then restore
-fill_val = float(np.nanmean(raw))
-raw_filled_for_zoom = np.where(nan_orig, fill_val, raw)
+# Fill first, then upscale: interpolating across a data/NaN edge would mix the
+# valid border pixels with the fill value.
+filled = zoom(raw_filled, SCALE, order=1).astype(np.float32)   # gap-free APOC input
 
-upscaled = zoom(raw_filled_for_zoom, SCALE, order=1).astype(np.float32)
-
-# Upscale NaN mask with nearest-neighbour and restore
-nan_up = zoom(nan_orig.astype(np.float32), SCALE, order=0).astype(bool)
-upscaled[nan_up] = np.nan
+# Upscale NaN mask with nearest-neighbour; the saved raster keeps NaN there
+nan_mask = zoom(nan_orig.astype(np.float32), SCALE, order=0).astype(bool)
+upscaled = filled.copy()
+upscaled[nan_mask] = np.nan
 
 H, W = upscaled.shape
 pixel_sx_up = pixel_sx / SCALE
@@ -156,17 +174,6 @@ with rasterio.open(upscaled_path, 'w', **upscaled_profile) as dst:
 print(f"  Upscaled shape : {H} x {W}  ({H*W/1e6:.3f} Mpx)")
 print(f"  Pixel size     : {pixel_sx_up:.4f} m x {pixel_sy_up:.4f} m")
 print(f"  Saved          : {upscaled_path}  [{time.time()-t0:.1f}s]")
-
-
-# ── 3. NaN fill (sigma=5) for APOC input ─────────────────────────────────────
-print("\n[3/4] NaN fill (sigma=5) ...")
-nan_mask = ~np.isfinite(upscaled)
-filled = upscaled.copy()
-if nan_mask.any():
-    tmp = np.where(nan_mask, 0.0, filled.astype(np.float64))
-    smooth = gaussian_filter(tmp, sigma=5)
-    filled = np.where(nan_mask, smooth, filled).astype(np.float32)
-print(f"  Filled {nan_mask.sum():,} NaN pixels")
 
 
 # ── 4. Tiled APOC-25 prediction ───────────────────────────────────────────────

@@ -74,8 +74,9 @@ python nnunet/predict_folder.py \
 **Output:**
 ```
 output/
-  masks/           <name>_mask.tif        binary mask  (0 = background, 1 = boulder)
+  masks/           <name>_mask.tif        binary mask  (0 = background, 1 = boulder; uint8, nodata tag 255)
   bathy_upscaled/  <name>_upscaled.tif    2× upscaled bathymetry for overlay in QGIS
+  summary.csv                             boulder pixels per file (count and % of the valid area)
 ```
 
 Large tiles are split automatically and stitched back together. Tiles are read
@@ -83,9 +84,10 @@ with an overlap border and only their core region is written back, so boulders
 straddling tile borders are not cut.
 
 **NoData handling:** the training tiles contained no NoData. During inference,
-NaN/NoData pixels are filled locally with a Gaussian blur (the same fill as the
-APOC pipeline) before prediction — not a flat 0.0, which would be a large outlier
-for depths around −20 m — and the final mask is forced to 0 in NoData areas, so no
+NaN/NoData pixels are filled at the original resolution with a normalised Gaussian
+convolution (σ = 5 px; blurred data divided by the blurred validity mask), so every
+filled pixel is a local weighted mean of the valid depths around it. The filled
+raster is then upscaled. The final mask is forced to 0 in NoData areas, so no
 boulders are reported there.
 
 ### Optional arguments

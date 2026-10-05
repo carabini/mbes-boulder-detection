@@ -23,30 +23,37 @@ Usage:
               so boulders straddling tile borders are not cut.
 
 NoData handling:
-  NaN/NoData pixels are filled locally with a Gaussian blur (sigma=5) before
-  prediction — the same fill used in the APOC pipeline — rather than a flat 0.0,
-  which would be a large outlier for depths around -20 m. After stitching, the
-  mask is forced to 0 wherever the upscaled bathymetry is NaN, so no boulders are
-  reported in NoData areas. (The training tiles contained no NoData.)
+  NaN/NoData pixels are filled at the original resolution with a normalised
+  Gaussian convolution (sigma=5 px): the blurred data are divided by the blurred
+  validity mask, so every filled pixel is a local weighted mean of the valid
+  depths around it. Pixels with no valid data in reach get the mean of the valid
+  data. The filled raster is then upscaled. This keeps the model input within
+  the real depth range, which matters because nnU-Net z-score-normalises each
+  image over all pixels, including the filled ones. After stitching, the mask is
+  forced to 0 in NoData areas, so no boulders are reported there. (The training
+  tiles contained no NoData, where the fill is a no-op.)
 
 Steps per file:
   1. Read GeoTIFF, save georef metadata
-  2. 2x bilinear upscale (matches training data format)
-  3. Write upscaled bathy GeoTIFF  (for QGIS overlay)
-  4. Fill NoData locally, tile with overlap, convert to temp NIfTI
-  5. Run nnUNetv2_predict (sliding window, all folds by default)
-  6. Read prediction NIfTI, write only each tile's core region
-  7. Mask out NoData areas, write binary mask GeoTIFF  {0=background, 1=boulder}
-  8. Clean up temp files
+  2. Fill NoData locally (original resolution)
+  3. 2x bilinear upscale (matches training data format)
+  4. Write upscaled bathy GeoTIFF with NoData restored  (for QGIS overlay)
+  5. Tile with overlap, convert to temp NIfTI
+  6. Run nnUNetv2_predict (sliding window, all folds by default)
+  7. Read prediction NIfTI, write only each tile's core region
+  8. Mask out NoData areas, write binary mask GeoTIFF  {0=background, 1=boulder}
+  9. Write summary.csv, clean up temp files
 
 Output structure:
   output/
-    masks/            <name>_mask.tif
+    masks/            <name>_mask.tif        uint8, 0=background, 1=boulder, nodata tag 255
     bathy_upscaled/   <name>_upscaled.tif
+    summary.csv       boulder pixels per file (count and % of the valid area)
 """
 
 import os
 import sys
+import csv
 import shutil
 import argparse
 import tempfile
@@ -80,25 +87,34 @@ def read_geotiff(path):
 
 
 def fill_nodata(arr, sigma=5):
-    """Fill NaN/NoData with a local Gaussian blur (mirrors fill_nodata in the
-    APOC training script). Avoids the large-outlier artefact of a flat 0.0 fill
-    for depth data around -20 m."""
+    """Fill NaN/NoData by normalised Gaussian convolution.
+
+    The blurred data (NoData set to 0) are divided by the blurred validity mask,
+    so the fill value is a local weighted mean of the valid neighbours and is
+    not pulled towards 0 as the local NoData fraction grows. Pixels with no
+    valid data in reach get the mean of the valid data. Valid pixels are
+    returned unchanged."""
     nan_mask = ~np.isfinite(arr)
     if not nan_mask.any():
         return arr.astype(np.float32)
-    smooth = gaussian_filter(np.where(nan_mask, 0.0, arr).astype(np.float64), sigma=sigma)
-    return np.where(nan_mask, smooth, arr).astype(np.float32)
+    if nan_mask.all():
+        return np.zeros_like(arr, dtype=np.float32)
+    num = gaussian_filter(np.where(nan_mask, 0.0, arr).astype(np.float64), sigma=sigma)
+    den = gaussian_filter((~nan_mask).astype(np.float64), sigma=sigma)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        filled = np.where(den > 1e-8, num / den, np.nan)
+    filled = np.where(np.isfinite(filled), filled, np.nanmean(arr))
+    return np.where(nan_mask, filled, arr).astype(np.float32)
 
 
-def upscale_bathy(arr, scale=2):
-    """2x bilinear upscale, NaN-safe."""
-    nan_mask  = np.isnan(arr)
-    fill_val  = np.nanmean(arr) if not np.all(nan_mask) else 0.0
-    filled    = np.where(nan_mask, fill_val, arr)
-    up        = zoom(filled, scale, order=1).astype(np.float32)
-    up_nan    = zoom(nan_mask.astype(np.float32), scale, order=0).astype(bool)
-    up[up_nan] = np.nan
-    return up
+def upscale_bathy(arr_filled, scale=2):
+    """2x bilinear upscale of a gap-free array (fill NoData first)."""
+    return zoom(arr_filled, scale, order=1).astype(np.float32)
+
+
+def upscale_nodata_mask(nan_mask, scale=2):
+    """Nearest-neighbour upscale of the NoData mask."""
+    return zoom(nan_mask.astype(np.float32), scale, order=0).astype(bool)
 
 
 def upscaled_transform(src_transform, src_w, src_h, scale):
@@ -279,25 +295,30 @@ def run_pipeline(input_dir, output_dir, folds=None, scale=2, dataset_id=None,
     file_meta  = {}
     case_counter = 0
 
-    print("\n--- Step 1-3: Upscale + write bathy GeoTIFFs + convert to NIfTI ---")
+    print("\n--- Step 1-5: Fill + upscale + write bathy GeoTIFFs + convert to NIfTI ---")
     for tif_path in tif_files:
         stem = tif_path.stem
         print(f"  {tif_path.name}")
 
         arr, profile, pixel_size, transform, crs, w, h = read_geotiff(tif_path)
 
-        up_arr               = upscale_bathy(arr, scale)
+        # Fill NoData at the original resolution first, then upscale. Upscaling
+        # first would interpolate across every data/NoData edge and mix the
+        # valid border pixels with the fill value.
+        nan_native    = ~np.isfinite(arr)
+        up_arr_filled = upscale_bathy(fill_nodata(arr), scale)   # model input
+        up_nan        = upscale_nodata_mask(nan_native, scale)
         up_transform, uw, uh = upscaled_transform(transform, w, h, scale)
         up_pixel_size        = pixel_size / scale
 
-        # Save upscaled bathy GeoTIFF (keeps NaN in the data)
+        # Save upscaled bathy GeoTIFF (keeps NaN in the NoData areas)
+        up_arr = up_arr_filled.copy()
+        up_arr[up_nan] = np.nan
         bathy_out = bathy_dir / f"{stem}_upscaled.tif"
         save_bathy_geotiff(up_arr, up_transform, crs, bathy_out)
-        print(f"    Bathy saved: {bathy_out.name}  ({uw}x{uh} px, {up_pixel_size:.4f} m/px)")
-
-        # Local Gaussian NoData fill (not a flat 0.0) for the model input.
-        up_nan        = ~np.isfinite(up_arr)
-        up_arr_filled = fill_nodata(up_arr)
+        print(f"    Bathy saved: {bathy_out.name}  ({uw}x{uh} px, {up_pixel_size:.4f} m/px, "
+              f"NoData {100 * nan_native.mean():.1f}%)")
+        del up_arr
 
         tiles = compute_tiles(uh, uw, tile_size=tile_size)
         n_tiles = len(tiles)
@@ -340,6 +361,7 @@ def run_pipeline(input_dir, output_dir, folds=None, scale=2, dataset_id=None,
     print("\n--- Step 4: Stitch tiles + convert to GeoTIFF masks ---")
 
     # Collect tile predictions per file and stitch (core regions only)
+    summary = []
     for stem, fmeta in file_meta.items():
         full_h, full_w = fmeta["shape"]
         full_mask = np.zeros((full_h, full_w), dtype=np.uint8)
@@ -365,8 +387,17 @@ def run_pipeline(input_dir, output_dir, folds=None, scale=2, dataset_id=None,
         save_mask_geotiff(full_mask, fmeta["transform"], fmeta["crs"], mask_out)
 
         n_boulders_px = int((full_mask == 1).sum())
-        pct = 100 * n_boulders_px / full_mask.size
-        print(f"  {mask_out.name}  —  boulder px: {n_boulders_px} ({pct:.1f}%)")
+        n_valid_px    = int((~fmeta["nan_mask"]).sum())
+        pct = 100 * n_boulders_px / max(n_valid_px, 1)
+        summary.append((stem, n_boulders_px, pct))
+        print(f"  {mask_out.name}  —  boulder px: {n_boulders_px} ({pct:.2f}% of the valid area)")
+
+    summary_path = output_dir / "summary.csv"
+    with open(summary_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["file", "boulder_px", "pct_of_valid_area"])
+        for stem, n_px, pct in summary:
+            writer.writerow([stem, n_px, f"{pct:.4f}"])
 
     # Cleanup
     shutil.rmtree(tmp)
@@ -374,6 +405,7 @@ def run_pipeline(input_dir, output_dir, folds=None, scale=2, dataset_id=None,
     print(f"\nDone! Outputs in: {output_dir}")
     print(f"  Masks:          {masks_dir}")
     print(f"  Bathy upscaled: {bathy_dir}")
+    print(f"  Summary:        {summary_path}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

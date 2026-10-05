@@ -48,9 +48,13 @@ python train_upscaled_sparse_bg10to1_25pct_sigma2346_v1.py
 
 ### 4. `predict_apoc25.py` — Predict on new GeoTIFFs
 Full inference pipeline for new bathymetry files:
-1. 2× bilinear upscaling
-2. Tiled APOC prediction (512 px tiles, 64 px overlap)
-3. Per-boulder statistics (area, height, diameter) → CSV output
+1. NoData fill at the original resolution (normalised Gaussian convolution, σ = 5 px —
+   the same fill as `../nnunet/predict_folder.py`)
+2. 2× bilinear upscaling
+3. Tiled APOC prediction (512 px tiles, 64 px overlap)
+4. Per-boulder statistics (area, height, diameter) → CSV output
+
+No boulders are reported in NoData areas.
 
 The prediction is the raw model output — no post-processing filter is applied.
 
