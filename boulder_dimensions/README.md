@@ -62,11 +62,6 @@ row carries the segment centroid in map coordinates (`centroid_x`, `centroid_y`)
 outcrop areas segmented as one object). It is off by default and not part of the
 paper method.
 
-**Limitation:** the height method assumes the boulder sits *on* the surrounding
-seafloor. Boulders lying inside a scour depression can get a height near zero or
-slightly negative, because the ring reference lies above the boulder top. These are
-not false detections; treat their height as unreliable rather than filtering them out.
-
 ## Important notes
 
 - **Height method**: `max(depth[boulder_pixels]) − P10(depth[ring_pixels])`.
