@@ -110,38 +110,29 @@ def match_greedy(iou, threshold=0.1):
 
 
 def _as_labeled(mask_or_labeled):
-    """Return an instance-labeled int array.
+    """Return an instance-labeled int array (8-connectivity).
 
-    Inputs with max value <= 1 are treated as binary masks and labelled with
-    8-connectivity; inputs with higher values are assumed to already carry
-    instance labels (e.g. an APOC ObjectSegmenter result).
+    Every input -- binary mask or instance-labelled array -- is binarised
+    (value > 0) and relabelled with 8-connectivity, so that all methods are
+    evaluated with exactly the same object definition.
 
-    Already-labeled inputs are relabeled consecutively (1..N). Label IDs are not
-    assumed contiguous: predict_apoc25.py advances a global segment offset while
-    cropping segments away at tile borders, so its rasters have gaps in the ID
-    sequence. Deriving n_pred from labeled.max() on such a raster would count
-    those unused IDs as phantom objects (false positives).
+    Pre-existing instance labels are deliberately NOT reused: APOC's
+    ObjectSegmenter labels with 4-connectivity, and keeping those labels made
+    APOC objects split along diagonals (more, smaller objects -> extra false
+    positives) while nnU-Net masks were labelled with 8-connectivity.
+    Relabelling also removes gaps in label IDs (e.g. tile-cropped
+    predict_apoc25.py output) and re-joins objects cut at tile borders.
     """
     arr = np.asarray(mask_or_labeled)
-    if arr.size == 0 or arr.max() <= 1:
-        labeled, n = label_objects(arr > 0)
-        return labeled, n
-    # Gapped labels (e.g. from tile-cropped predict_apoc25.py output): compress to
-    # a consecutive range. np.unique maps the smallest value to 0.
-    _, inv = np.unique(arr, return_inverse=True)
-    labeled = inv.reshape(arr.shape).astype(np.int32)
-    # np.unique maps the smallest value to 0; if background (0) is absent, shift so
-    # labels start at 1 (edge case where every pixel is foreground).
-    if arr.min() > 0:
-        labeled = labeled + 1
-    return labeled, int(labeled.max())
+    return label_objects(arr > 0)
 
 
 def evaluate_tile(gt_binary, pred_binary_or_labeled, threshold=0.1):
     """Evaluate one tile.
 
     gt_binary               : binary GT mask (boulder vs. not).
-    pred_binary_or_labeled  : binary prediction OR an instance-labelled array.
+    pred_binary_or_labeled  : binary prediction OR an instance-labelled array
+                              (always binarised and relabelled, 8-connectivity).
 
     Returns a dict with raw counts (tp, fp, fn, n_gt, n_pred) and the object
     Jaccard (mean best-IoU per GT object). Tiles with zero GT objects are handled
